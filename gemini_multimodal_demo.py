@@ -4,8 +4,8 @@ Gemini Multimodal Demo with Requests
 Purpose:
   This script demonstrates multimodal interaction with Google's Gemini API
   using the `requests` library for HTTP communication. It can send text,
-  a video frame captured from an RTSP stream, and raw PCM audio data (via a socket server)
-  to the Gemini model and process the response (text and potentially output audio).
+  a video frame captured from an RTSP stream, and fetch raw PCM audio data
+  via a TCP client from an external audio server.
 
 Dependencies:
   - requests: For making HTTP requests to the Gemini API.
@@ -24,59 +24,45 @@ Configuration:
    - The Gemini model to use (e.g., "gemini-1.5-flash-latest", "gemini-1.5-pro-latest").
    - Default: "gemini-1.5-flash-latest"
 
-3. RTSP_URL:
-   - The URL of the RTSP video stream you want to capture a frame from.
-   - Example: 'rtsp://username:password@your_camera_ip/stream_path'
-   - Default: 'rtsp://192.168.66.130/main_ch' (replace with your actual RTSP URL)
+3. VIDEO_SOURCE_IP & RTSP_URL:
+   - VIDEO_SOURCE_IP: IP address of your RTSP video stream server.
+     Default: "192.168.66.130" (REPLACE with your camera's IP address)
+   - RTSP_URL: The full RTSP URL. It's constructed using VIDEO_SOURCE_IP by default.
+     Example: f'rtsp://{VIDEO_SOURCE_IP}/main_ch'
+     If your RTSP stream requires username/password, embed them directly in the
+     RTSP_URL string or modify the f-string construction.
 
-4. Audio Input Server:
-   - The script starts a TCP socket server to listen for incoming raw PCM audio.
-   - AUDIO_SERVER_HOST: Host for the audio server. '0.0.0.0' listens on all interfaces.
-     Default: '0.0.0.0'
-   - AUDIO_SERVER_PORT: Port for the audio server.
-     Default: 6790
-   - AUDIO_SAMPLE_RATE: Sample rate of the incoming PCM audio. MUST match the source.
-     Default: 8000 (Hz)
-   - AUDIO_CHANNELS: Number of audio channels. MUST match the source.
-     Default: 1 (mono)
-   - AUDIO_DTYPE: Data type of the incoming PCM audio samples.
-     Default: 'int16' (signed 16-bit integers)
-     This configuration corresponds to 'audio/L16' MIME type for Gemini.
-
-Sending Audio to the Script:
-  You need to send raw PCM audio data that matches the configured sample rate,
-  channels, and data type (signed 16-bit integer Little Endian is typical for .raw or .pcm files).
-
-  Example using `netcat` (nc) on Linux/macOS:
-  1. Ensure you have a raw audio file (e.g., `audio.raw`) in the correct format.
-     You can create one with `ffmpeg`:
-     `ffmpeg -i your_audio_file.mp3 -f s16le -ar 8000 -ac 1 audio.raw`
-     (Adjust -ar and -ac to match AUDIO_SAMPLE_RATE and AUDIO_CHANNELS if changed)
-  2. Once the script's audio server is running (it will print a message),
-     run the following command in a separate terminal:
-     `nc <AUDIO_SERVER_HOST> <AUDIO_SERVER_PORT> < audio.raw`
-     (Replace <AUDIO_SERVER_HOST> and <AUDIO_SERVER_PORT> with the script's actual values,
-      e.g., `nc localhost 6790 < audio.raw` if running on the same machine).
-     The audio data will be sent once, and `nc` will close the connection. The script
-     will then use this audio for the *next* Gemini request you trigger by entering text.
+4. Audio Input (TCP Client):
+   - The script acts as a TCP client to fetch audio from your existing audio server.
+   - AUDIO_SOURCE_IP: The IP address of your audio server.
+     Defaults to VIDEO_SOURCE_IP but can be set independently.
+   - AUDIO_SOURCE_PORT: The port your audio server is listening on (e.g., 6791).
+   - AUDIO_COMMAND (optional): The command sent to your server after connection (e.g., b"pcm").
+   - The script expects to receive RAW PCM audio data from your server.
+   - Expected PCM format: Sample Rate = AUDIO_SAMPLE_RATE (e.g., 8000 Hz),
+                         Channels = AUDIO_CHANNELS (e.g., 1 for mono),
+                         Bit Depth = 16-bit signed integer (AUDIO_DTYPE = 'int16').
 
 Running the Script:
-  1. Configure the variables above, especially `GEMINI_API_KEY` (as env var or be ready to paste it)
-     and `RTSP_URL`.
-  2. Run the script: `python gemini_multimodal_demo.py`
-  3. The script will:
-     - Attempt to start the audio input server.
+  1. Configure the variables below, especially:
+     - `GEMINI_API_KEY` (as env var or be ready to paste it).
+     - `VIDEO_SOURCE_IP` (for RTSP video).
+     - `AUDIO_SOURCE_IP` and `AUDIO_SOURCE_PORT` if your audio server is different from the video source.
+  2. Ensure your audio server (if you're using audio input) is running and accessible.
+  3. Run the script: `python gemini_multimodal_demo.py`
+  4. The script will:
      - Prompt you to enter a text query for Gemini.
-     - Attempt to capture a frame from the `RTSP_URL`.
-     - If you have sent audio via the socket, it will use the last received audio.
-     - Send the combined inputs to Gemini.
+     - Attempt to capture a frame from the RTSP stream.
+     - Attempt to connect to your audio server and fetch audio data.
+     - Send the combined inputs (text, video frame, audio data) to Gemini.
      - Print Gemini's text response and save any audio output from Gemini to a file.
-  4. To send new audio for a subsequent turn (if you modify the script for multiple turns),
-     you'll need to run the `nc` command again.
 
 Troubleshooting:
-  - "Error: Could not open RTSP stream": Check your RTSP_URL, camera credentials, and network.
-  - Audio server errors: Ensure the port is not in use. Verify the client is sending compatible PCM data.
+  - "Error: Could not open RTSP stream": Check `VIDEO_SOURCE_IP` and the RTSP path in `RTSP_URL`.
+    Verify camera credentials if needed (you might need to modify `RTSP_URL` structure for username/password).
+  - "Timeout connecting to audio source" or "Connection refused": Check `AUDIO_SOURCE_IP` and
+    `AUDIO_SOURCE_PORT`. Ensure your audio server is running and accessible from where you
+    run this script. Check firewalls.
   - Gemini API errors: Check your API key and ensure the model name is correct.
 """
 import os
@@ -85,36 +71,109 @@ import json
 import base64
 import cv2  # OpenCV for video
 import socket
-import threading
-import time # For potential delays or timeouts
+import threading # Keep for main, even if audio server thread is gone
+import time
 
 # --- Configuration ---
-# 1. Gemini API Key (REQUIRED)
-# Set as environment variable GEMINI_API_KEY or enter when prompted.
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+# 核心配置 (Core Configuration)
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")  # Gemini API密钥,优先从环境变量读取 (Gemini API Key, read from env var first)
+MODEL_NAME = "gemini-1.5-flash-latest"             # 使用的Gemini模型名称 (Gemini model name to use)
 
-# 2. Gemini Model Name
-# Recommend using a model that supports multimodal input.
-MODEL_NAME = "gemini-1.5-flash-latest" # Or "gemini-1.5-pro-latest"
+# 视频配置 (Video Configuration)
+VIDEO_SOURCE_IP = "192.168.66.130"                 # 视频流服务器IP地址 (IP address of the video stream server, REPLACE with your camera's IP)
+# RTSP_URL_FORMAT = 'rtsp://{username}:{password}@{ip}/your_stream_path' # Optional: if you have a more complex URL structure with auth
+RTSP_URL = f'rtsp://{VIDEO_SOURCE_IP}/main_ch'     # RTSP视频流URL (RTSP video stream URL, constructed using VIDEO_SOURCE_IP)
+                                                   # If your RTSP stream requires username/password, embed them directly or use a more complex format string.
 
-# 3. Video Configuration
-RTSP_URL = 'rtsp://192.168.66.130/main_ch' # REPLACE with your actual RTSP stream URL
+# 音频输入配置 (TCP客户端从外部服务器获取) - Audio Input Configuration (TCP Client from external server)
+AUDIO_SOURCE_IP = VIDEO_SOURCE_IP              # 音频源服务器IP地址 (默认为视频IP,可独立设置) (Audio source server IP, defaults to VIDEO_SOURCE_IP, can be set independently)
+AUDIO_SOURCE_PORT = 6791                       # 音频源服务器端口 (Audio source server port)
+AUDIO_COMMAND = b"pcm"                         # 连接后发送到音频源的命令 (Command sent to audio source after connection)
+AUDIO_BUFFER_SIZE = 4096                       # 接收音频数据的缓冲区大小 (Buffer size for receiving audio data)
+MAX_AUDIO_DURATION_SECONDS = 5                 # 单次请求允许接收音频的最大时长（秒） (Max duration to receive audio for a single request)
 
-# 4. Audio Input Configuration (Socket Server)
-AUDIO_SERVER_HOST = '0.0.0.0'  # Listen on all available interfaces
-AUDIO_SERVER_PORT = 6790       # Port for receiving PCM audio
-AUDIO_SAMPLE_RATE = 8000       # Sample rate of the incoming PCM audio (e.g., 8000, 16000, 44100)
-AUDIO_CHANNELS = 1             # Number of audio channels (1 for mono, 2 for stereo)
-AUDIO_DTYPE = 'int16'          # Data type of incoming PCM (signed 16-bit integer)
-                               # This translates to 'audio/L16' (Linear 16-bit PCM) for Gemini
+# 音频格式配置 (Audio Format Configuration - for data received from AUDIO_SOURCE and sent to Gemini)
+AUDIO_SAMPLE_RATE = 8000                       # 音频采样率 (例如 8000 Hz) (Audio sample rate, e.g., 8000 Hz)
+AUDIO_CHANNELS = 1                             # 音频通道数 (例如 1) (Number of audio channels, e.g., 1 for mono)
+AUDIO_DTYPE = 'int16'                          # 音频数据类型 (例如 'int16' -> 16-bit signed integer PCM) (Audio data type)
+                                               # 这用于确定发送给Gemini的MIME类型 e.g. audio/L16 (This is used to determine the MIME type for Gemini, e.g., audio/L16)
 
 # --- Global Variables ---
-# This global variable will store the latest received audio data (base64 encoded)
-latest_base64_audio_data = None
-audio_server_running = True
+# No global variables needed for audio server/client management anymore.
 
 
 # --- Function Definitions ---
+
+def get_audio_from_source(host, port, command, buffer_size, max_duration_sec):
+    # 获取音频数据的TCP客户端
+    # Args:
+    #   host (str): 音频源服务器IP地址
+    #   port (int): 音频源服务器端口
+    #   command (bytes): 连接后发送到音频源的命令 (例如 b"pcm")
+    #   buffer_size (int):接收数据的缓冲区大小
+    #   max_duration_sec (int): 最大录制/接收音频的时长（秒）
+    # Returns:
+    #   bytes: 接收到的PCM音频数据，如果出错或没有数据则返回None
+    print(f"Attempting to connect to audio source at {host}:{port}...")
+    client_socket = None
+    try:
+        client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client_socket.settimeout(5.0) # Connection timeout
+        client_socket.connect((host, port))
+        print(f"Connected to audio source. Sending command: {command}")
+        client_socket.sendall(command)
+
+        received_data = bytearray()
+        start_time = time.time()
+        client_socket.settimeout(2.0) # Timeout for individual recv calls
+
+        print("Receiving audio data...")
+        while True:
+            if (time.time() - start_time) > max_duration_sec:
+                print(f"Max audio duration of {max_duration_sec} seconds reached. Stopping audio capture.")
+                break
+            try:
+                chunk = client_socket.recv(buffer_size)
+                if not chunk:
+                    print("Audio source closed connection or sent no more data.")
+                    break  # Server closed connection or sent empty data
+                received_data.extend(chunk)
+            except socket.timeout:
+                # This timeout means no data received in the last X seconds on this connection.
+                # If we've already received some data, we can assume the server is done sending for now.
+                if received_data:
+                    print("Audio receive timed out, data was received. Assuming audio segment complete.")
+                else:
+                    print("Audio receive timed out, no data received from audio source.")
+                break 
+            except Exception as e:
+                print(f"Error receiving audio data: {e}")
+                break
+        
+        if received_data:
+            print(f"Received {len(received_data)} bytes of audio data from source.")
+            return bytes(received_data) # Convert bytearray to bytes
+        else:
+            print("No audio data received from source.")
+            return None
+
+    except socket.timeout:
+        print(f"Timeout connecting to audio source at {host}:{port}.")
+        return None
+    except ConnectionRefusedError:
+        print(f"Connection refused by audio source at {host}:{port}. Ensure the audio server is running.")
+        return None
+    except Exception as e:
+        print(f"Error connecting to or getting data from audio source: {e}")
+        return None
+    finally:
+        if client_socket:
+            try:
+                client_socket.shutdown(socket.SHUT_RDWR) # Gracefully shutdown
+            except OSError:
+                pass # Ignore if already closed
+            client_socket.close()
+            print("Audio source client socket closed.")
 
 def get_gemini_api_key():
     """
@@ -150,10 +209,6 @@ def capture_video_frame(rtsp_url):
             print(f"Error: Could not open RTSP stream at {rtsp_url}")
             return None
 
-        # Set a timeout for reading the frame (e.g., 5 seconds)
-        # This requires a loop and checking time, as VideoCapture doesn't have a direct timeout for read()
-        # For simplicity in this step, we'll do a direct read.
-        # Consider adding a more robust timeout mechanism if needed.
         print("Reading frame from RTSP stream...")
         ret, frame = cap.read()
 
@@ -178,82 +233,6 @@ def capture_video_frame(rtsp_url):
         if cap is not None and cap.isOpened():
             cap.release()
             print("RTSP stream capture released.")
-
-def audio_input_server(host, port):
-    """Runs a socket server to receive PCM audio data and updates global variable."""
-    # TODO: Implement in Step 3
-    global latest_base64_audio_data
-    global audio_server_running
-
-    server_socket = None # Initialize server_socket
-
-    try:
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # Allow address reuse
-        server_socket.bind((host, port))
-        server_socket.listen(1) # Listen for one connection at a time
-        print(f"Audio input server listening on {host}:{port}...")
-
-        while audio_server_running:
-            conn = None # Initialize conn
-            try:
-                # Set a timeout for accept, so it doesn't block indefinitely and can check audio_server_running
-                server_socket.settimeout(1.0) 
-                try:
-                    conn, addr = server_socket.accept()
-                except socket.timeout:
-                    continue # Go back to check audio_server_running
-
-                print(f"Audio client connected from {addr}")
-                
-                received_data = bytearray() # Use bytearray for efficient concatenation
-                # Set a timeout for recv to handle cases where client connects but sends no data
-                conn.settimeout(5.0) # Timeout for individual recv calls
-
-                while audio_server_running: # Also check running flag here to stop mid-connection if needed
-                    try:
-                        chunk = conn.recv(4096) # Receive data in chunks
-                        if not chunk:
-                            print("Client closed connection or sent no more data.")
-                            break # Client closed connection or sent empty data
-                        received_data.extend(chunk)
-                        # Optional: Add a small delay if expecting very fragmented packets
-                        # time.sleep(0.01) 
-                    except socket.timeout:
-                        # This timeout means no data received in the last 5 seconds on this connection
-                        if received_data:
-                            print("Socket recv timed out, but some data was received. Assuming client finished sending.")
-                        else:
-                            print("Socket recv timed out, no data received from client on this connection.")
-                        break # Assume client is done sending for this connection
-                    except Exception as e:
-                        print(f"Error receiving audio data: {e}")
-                        break
-                
-                if received_data:
-                    print(f"Received {len(received_data)} bytes of audio data.")
-                    latest_base64_audio_data = base64.b64encode(received_data).decode('utf-8')
-                    print("Audio data base64 encoded and updated.")
-                else:
-                    print("No audio data received from this client connection.")
-
-            except Exception as e:
-                if audio_server_running: # Only print error if server is supposed to be running
-                    print(f"Error in audio server connection/handling: {e}")
-            finally:
-                if conn:
-                    conn.close()
-                # If we break from the inner loop due to audio_server_running becoming false
-                if not audio_server_running:
-                    break 
-        
-    except Exception as e:
-        print(f"Fatal error in audio input server: {e}")
-    finally:
-        if server_socket:
-            server_socket.close()
-        print("Audio input server stopped.")
-
 
 def send_to_gemini(api_key, model_name, text_prompt, base64_image_data, base64_audio_data, audio_mime_type):
     """Sends the multimodal input to the Gemini API and returns the response."""
@@ -295,17 +274,12 @@ def send_to_gemini(api_key, model_name, text_prompt, base64_image_data, base64_a
         ],
         "generation_config": {
             # "response_mime_type": "application/json" # Default is JSON.
-            # If we want Gemini to try and output audio directly:
-            # "response_mime_type": "audio/opus" 
-            # For this demo, let's stick to the default and parse text/audio from the JSON response.
-            # We can add an option later if direct audio output is desired.
         }
     }
 
     headers = {'Content-Type': 'application/json'}
 
     print(f"Sending request to Gemini API: {api_url}")
-    # print(f"Request body: {json.dumps(request_body, indent=2)}") # Can be very verbose with base64 data
 
     try:
         response = requests.post(api_url, headers=headers, json=request_body, timeout=60)
@@ -337,7 +311,6 @@ def process_gemini_response(response):
         return
 
     try:
-        # Basic check for response structure
         if "candidates" not in response:
             print("Error: 'candidates' not found in Gemini response.")
             print(f"Full response for debugging: {json.dumps(response, indent=2)}")
@@ -348,7 +321,9 @@ def process_gemini_response(response):
             if "content" in candidate and "parts" in candidate["content"]:
                 for part_num, part in enumerate(candidate["content"]["parts"]):
                     if "text" in part:
-                        print(f"  Text Response (Part {part_num + 1}):\n    {part['text'].replace('\n', '\n    ')}")
+                        text_content = part['text']
+                        formatted_text = text_content.replace('\n', '\n    ')
+                        print(f"  Text Response (Part {part_num + 1}):\n    {formatted_text}")
                     
                     if "inline_data" in part:
                         inline_data = part["inline_data"]
@@ -359,39 +334,21 @@ def process_gemini_response(response):
                             print(f"  Received audio data (Part {part_num + 1}) with MIME type: {mime_type}")
                             try:
                                 audio_bytes = base64.b64decode(data_b64)
-                                
-                                # Determine file extension
-                                extension = mime_type.split('/')[-1].split(';')[0] # e.g., opus, wav, L16
-                                if not extension or not extension.replace('-', '').isalnum(): # Basic sanity check, allow hyphens
-                                    extension = "bin" # fallback extension
-
-                                # Create a unique filename
                                 timestamp = time.strftime("%Y%m%d-%H%M%S")
+                                extension = mime_type.split('/')[-1].split(';')[0]
+                                if not extension or not extension.replace('-', '').isalnum():
+                                    extension = "bin"
                                 filename = f"gemini_output_audio_{timestamp}_part{part_num + 1}.{extension}"
-                                
                                 with open(filename, "wb") as f:
                                     f.write(audio_bytes)
                                 print(f"  Saved Gemini audio output to: {filename}")
-
-                            except base64.binascii.Error as b64_err:
-                                print(f"  Error decoding base64 audio data: {b64_err}")
-                            except IOError as io_err:
-                                print(f"  Error saving audio file: {io_err}")
                             except Exception as e:
-                                print(f"  An unexpected error occurred while processing audio data: {e}")
-                        # else:
-                        #     print(f"  Received inline_data (Part {part_num + 1}) with non-audio MIME type or missing data: {mime_type}")
-
+                                print(f"  Error processing/saving audio data: {e}")
             else:
                 print(f"  Warning: Candidate {candidate_idx + 1} found without 'content' or 'parts'.")
-                # print(f"Problematic candidate: {json.dumps(candidate, indent=2)}")
 
-
-        # Handle potential top-level errors if not caught by status code check earlier
-        # and if no candidates were processed.
         if not response.get("candidates") and response.get("error"):
             print(f"Gemini API returned an error: {json.dumps(response.get('error'), indent=2)}")
-
 
     except Exception as e:
         print(f"An error occurred while processing the Gemini response: {e}")
@@ -399,68 +356,54 @@ def process_gemini_response(response):
 
 def main():
     """Main function to orchestrate the demo."""
-    global latest_base64_audio_data # To allow resetting it
-    global audio_server_running   # To control the server thread
-
     print("\n--- Gemini Multimodal Demo Initializing ---")
-    print("This demo supports text, RTSP video frame, and socket-based PCM audio input.")
+    print("This demo supports text, RTSP video frame, and audio input via TCP client.") 
     
     api_key = get_gemini_api_key()
-    # get_gemini_api_key now handles exit if key is not found, so no need to check api_key here.
-
-    audio_thread = None
+    
     try:
-        print(f"\nAttempting to start audio input server on {AUDIO_SERVER_HOST}:{AUDIO_SERVER_PORT}...")
-        audio_server_running = True # Explicitly set before starting thread
-        audio_thread = threading.Thread(target=audio_input_server, args=(AUDIO_SERVER_HOST, AUDIO_SERVER_PORT), daemon=True)
-        audio_thread.start()
-        
-        time.sleep(1) # Give the server a moment to start.
-        if not audio_thread.is_alive():
-            print("ERROR: Audio server thread failed to start. Please check for port conflicts or other errors.")
-            print("Proceeding without audio input capabilities for this session.")
-        else:
-            print(f"Audio input server thread started successfully.")
-            print(f" -> Please send RAW PCM audio data ({AUDIO_SAMPLE_RATE}Hz, {AUDIO_CHANNELS}-channel, {AUDIO_DTYPE} signed integer)")
-            print(f"    to TCP socket: {AUDIO_SERVER_HOST_DISPLAY}:{AUDIO_SERVER_PORT}")
-            print(f"    Example: nc {AUDIO_SERVER_HOST_DISPLAY} {AUDIO_SERVER_PORT} < my_audio.raw")
-
-        # --- Main Interaction ---
         print("\n--- Ready for User Input ---")
         text_input = input("Enter your text prompt for Gemini (or press Enter to skip text): ").strip()
         
         print("\nAttempting to capture video frame...")
-        video_frame_b64 = capture_video_frame(RTSP_URL)
+        video_frame_b64 = capture_video_frame(RTSP_URL) # RTSP_URL is now from global config
         if video_frame_b64:
             print("Video frame captured.")
         else:
             print("No video frame captured or video input failed.")
         
-        # Retrieve the latest audio data captured by the server thread
-        # and reset it so it's not used again for a future turn unless new audio comes in.
-        current_audio_b64 = latest_base64_audio_data
-        latest_base64_audio_data = None # Reset for next potential turn
+        print("\nAttempting to fetch audio from TCP source...")
+        raw_audio_data = get_audio_from_source(
+            AUDIO_SOURCE_IP, 
+            AUDIO_SOURCE_PORT,
+            AUDIO_COMMAND,
+            AUDIO_BUFFER_SIZE,
+            MAX_AUDIO_DURATION_SECONDS
+        )
 
-        if current_audio_b64:
-            print(f"Audio data captured ({len(current_audio_b64)} base64 chars).")
-            audio_mime = f"audio/L16;rate={AUDIO_SAMPLE_RATE};channels={AUDIO_CHANNELS}"
+        current_audio_b64 = None
+        audio_mime_type = None 
+
+        if raw_audio_data:
+            print(f"Audio data fetched successfully ({len(raw_audio_data)} bytes). Encoding to Base64...")
+            current_audio_b64 = base64.b64encode(raw_audio_data).decode('utf-8')
+            audio_mime_type = f"audio/L16;rate={AUDIO_SAMPLE_RATE};channels={AUDIO_CHANNELS}" 
+            print("Audio Base64 encoded.")
         else:
-            print("No audio data captured for this request.")
-            audio_mime = None
-            current_audio_b64 = None # Ensure it's explicitly None if no data
+            print("No audio data fetched from source or an error occurred.")
 
         if not text_input and not video_frame_b64 and not current_audio_b64:
             print("\nNo input (text, video, or audio) provided. Exiting demo interaction.")
-            return # Exits after finally block
+            return 
 
         print("\nSending request to Gemini...")
         gemini_response = send_to_gemini(
             api_key, 
             MODEL_NAME, 
-            text_input if text_input else None, # Send None if empty string
+            text_input if text_input else None,
             video_frame_b64, 
-            current_audio_b64,
-            audio_mime
+            current_audio_b64, 
+            audio_mime_type    
         )
         
         print("\n--- Gemini Response ---")
@@ -474,15 +417,6 @@ def main():
     except Exception as e:
         print(f"An unexpected error occurred in main: {e}")
     finally:
-        if audio_thread is not None: # Check if thread was ever assigned
-            print("\nShutting down audio server...")
-            audio_server_running = False # Signal the server thread to stop
-            if audio_thread.is_alive():
-                audio_thread.join(timeout=5) # Wait for the thread to finish
-                if audio_thread.is_alive():
-                    print("Warning: Audio server thread did not stop cleanly.")
-            else:
-                print("Audio server thread was not alive or already stopped.")
         print("Demo finished.")
 
 if __name__ == "__main__":
